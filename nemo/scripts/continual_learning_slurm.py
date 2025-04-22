@@ -12,83 +12,93 @@ import nemo_run as run
 from nemo import lightning as nl
 from nemo.collections import llm
 from nemo.collections.common.tokenizers import AutoTokenizer
+from megatron.core.optimizer import OptimizerConfig
 from lightning.pytorch.loggers import WandbLogger
 
 load_dotenv()
 
 PROJECT_NAME = "BFS"
-RUN_NAME = "qwen25_1p5b_continual"
+RUN_NAME = "qwen25_7b_continual"
 
 # SLURM RELATED
 USER = None # for SSH tunnel
 HOST = None # for SSH tunnel
 JOB_DIR = "/mnt/home/jinheo/.nemo_run/experiments/"
-ACCOUNT = "h100"
+ACCOUNT = "BFS" # SLURM account
 PARTITION = "h100"
 CONTAINER_IMAGE = "/mnt/cephfs/scratch/enroot-images/nvidia-nemo:25.04.rc2.sqsh"
 CUSTOM_MOUNTS = [
-    "/home/jyjung:/home/jyjung",
     "/mnt/cephfs:/cephfs",
-    "/dev/infiniband/:/dev/infiniband",
+    "/dev/infiniband/:/dev/infiniband",  # infiniband might not be needed
 ]
-EXCLUSIVE = None, # if you want to use exclusive node, set to True or erase this line
-NODELIST = None # "DGX-H100-[1,4]"
-EXCLUDE = None # "DGX-H100-[10-12]"
+NODELIST = "DGX-H100-[1,3,4,5]" # replace with None
+EXCLUDE = "DGX-H100-[10-12]" # replace with None
 
 # Logging and Checkpointing Related
-MAX_EPOCHS = None
-MAX_STEPS = 1000
+MAX_EPOCHS = 1
+MAX_STEPS = 10300
 LIMIT_VAL_BATCHES = 0 # 0 means no validation
-LOG_EVERY_N_TRAIN_STEPS = 10000
 VAL_CHECK_INTERVAL = 100
-LOG_EVERY_N_STEPS = 100
-CHECKPOINT_DIR_BASE_PATH = f"/mnt/cephfs/scratch/{PROJECT_NAME}/f{RUN_NAME}"
+LOG_EVERY_N_STEPS = 10
+CHECKPOINT_DIR_BASE_PATH = f"/cephfs/scratch/{PROJECT_NAME}/{RUN_NAME}"
+
+# Learning Rate Related
+WARMUP_STEPS = MAX_STEPS * 0.1
+MIN_LR = 1.5e-06
+MAX_LR = 1.5e-05
 
 # GPU and Node Related
-NODES = 2
-GPUS_PER_NODE = 2
+NODES = 1
+GPUS_PER_NODE = 8
 
-TENSOR_PARALLEL = 1
+TENSOR_PARALLEL = 2
 PIPELINE_PARALLEL = 1
 CONTEXT_PARALLEL = 1
 
 # Data and Model Related
 SEQUENCE_LENGTH = 8192
+GLOBAL_BATCH_SIZE = 1024
 PER_GPU_BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 1
-GLOBAL_BATCH_SIZE = PER_GPU_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * GPUS_PER_NODE * NODES
 
-PRETRAINED_MODEL_NAME = "Qwen/Qwen2.5-1.5B"
+PRETRAINED_MODEL_NAME = "Qwen/Qwen2.5-7B"
 DATA_PATH = [
-    # 0.25, "/home/jyjung/megatron/fineweb-edu-dedup-even/fineweb-edu-dedup-even_text_document",
-    # 0.25, "/home/jyjung/megatron/fineweb-edu-dedup-odd/fineweb-edu-dedup-odd_text_document",
-    1, "/home/jyjung/megatron/maumweb-edu/maumweb-edu_text_document",
+    0.25, "/cephfs/scratch/BFS/data/fineweb-edu-dedup-even/fineweb-edu-dedup-even_text_document",
+    0.25, "/cephfs/scratch/BFS/data/fineweb-edu-dedup-odd/fineweb-edu-dedup-odd_text_document",
+    0.5, "/cephfs/scratch/BFS/data/maumweb-edu/maumweb-edu_text_document",
 ]
+
+
+ENV_VARS = {
+    'WANDB_API_KEY': os.getenv('WANDB_API_KEY'),
+    'NCCL_SOCKET_IFNAME': 'ibp64s0', # Infiniband
+    'NEMO_HOME': '/cephfs/scratch/BFS/nemo_home',
+    'NEMO_MODELS_CACHE': '/cephfs/scratch/BFS/nemo_home/.cache/nemo/models',
+}
 
 
 # ────────────────────────────────────────────────────────────
 # 1.  Core recipe (unchanged from your local script)
 # ────────────────────────────────────────────────────────────
-def configure_recipe(nodes: int = 2, gpus_per_node: int = 8) -> run.Partial:
+def configure_recipe() -> run.Partial:
     # 1‑a  Convert HF checkpoint once (only rank‑0 actually runs it)
     # llm.import_ckpt(
     #     model=llm.Qwen2Model(llm.Qwen25Config1P5B()),
     #     source="hf://Qwen/Qwen2.5-1.5B",
     # )
 
-    recipe = llm.qwen25_1p5b.pretrain_recipe(
+    recipe = llm.qwen25_7b.pretrain_recipe(
         dir=CHECKPOINT_DIR_BASE_PATH,
         name=RUN_NAME,
         num_nodes=NODES,
         num_gpus_per_node=GPUS_PER_NODE,
     )
-    recipe.model.config.seq_length = SEQUENCE_LENGTH
+    # recipe.model.config.seq_length = SEQUENCE_LENGTH
 
     # Continual‑learning resume logic
     recipe.resume = run.Config(
         nl.AutoResume,
         restore_config=run.Config(nl.RestoreConfig, path=f"nemo://{PRETRAINED_MODEL_NAME}"),
-        # resume_if_exists=True,
+        resume_if_exists=True, # a must for resuming from a pretrained checkpoint
         # resume_ignore_no_checkpoint=True,
     )
 
@@ -103,10 +113,31 @@ def configure_recipe(nodes: int = 2, gpus_per_node: int = 8) -> run.Partial:
     recipe.trainer.limit_val_batches = LIMIT_VAL_BATCHES
     recipe.trainer.val_check_interval = VAL_CHECK_INTERVAL
 
+    
+    # Modify Learning Rate Scheduler if needed
+    # from torch.optim import AdamW
 
-    # Data
+    # recipe.optim = run.Config(
+    #     PytorchOptimizerModule,
+    #     optimizer_fn=run.Partial(
+    #         AdamW,
+    #         lr=MAX_LR,
+    #         weight_decay=0.1,
+    #         betas=(0.9, 0.95),
+    #         eps=1e-8,
+    #         foreach=True,
+    #     ),
+    # )
+    
+    # recipe.optim.optimizer = "adamw"
+    recipe.optim.lr_scheduler.warmup_steps = WARMUP_STEPS
+    recipe.optim.lr_scheduler.min_lr = MIN_LR
+    recipe.optim.config.lr = MAX_LR
+    
+    # For testing, comment following data reinitialization. MockDataModule is used with recipe as default. 
     recipe.data = run.Config(
-        llm.MockDataModule,
+        llm.PreTrainingDataModule,
+        paths=DATA_PATH,
         seq_length=SEQUENCE_LENGTH,
         global_batch_size=GLOBAL_BATCH_SIZE,
         micro_batch_size=PER_GPU_BATCH_SIZE,
@@ -114,28 +145,25 @@ def configure_recipe(nodes: int = 2, gpus_per_node: int = 8) -> run.Partial:
             AutoTokenizer,
             pretrained_model_name=PRETRAINED_MODEL_NAME,
         ),
+        split="100,0,0",
+        # num_workers=DATA_LOADER_WORKERS,
+        # pin_memory=DATA_LOADER_PIN_MEMORY,
     )
-    # recipe.data = run.Config(
-    #     llm.PreTrainingDataModule,
-    #     paths=DATA_PATH,
-    #     seq_length=SEQUENCE_LENGTH,
-    #     global_batch_size=GLOBAL_BATCH_SIZE,
-    #     micro_batch_size=PER_GPU_BATCH_SIZE,
-    #     tokenizer=run.Config(
-    #         AutoTokenizer,
-    #         pretrained_model_name=PRETRAINED_MODEL_NAME,
-    #     ),
-    #     split="100,0,0",
-    #     # num_workers=DATA_LOADER_WORKERS,
-    #     # pin_memory=DATA_LOADER_PIN_MEMORY,
-    # )
+    
+    # Checkpointing
+    recipe.log.ckpt = run.Config(
+        nl.ModelCheckpoint,
+        # save_last=True,
+        save_top_k=1,
+        every_n_train_steps=10,
+        filename="{PRETRAINED_MODEL_NAME}--{step}-{consumed_samples}"
+    )
 
     # 🔑 1‑b  **Add W&B logger**
     wandb_logger_cfg = run.Config(
         WandbLogger,
         project=PROJECT_NAME,
         name=RUN_NAME,
-        save_dir="./wandb",          # local dir where W&B will cache runs
     )
     recipe.log.wandb = wandb_logger_cfg      # attach to NeMo logger
 
@@ -158,7 +186,7 @@ def slurm_executor(
     partition: Optional[str] = None,
     gpus_per_node: Optional[int] = None,
     container_image: Optional[str] = None,
-    time: str = "04:00:00",
+    time: str = None,
     gres: Optional[str] = None,
     mem: str = "0",
     exclusive: bool = True,
@@ -210,16 +238,7 @@ def slurm_executor(
 # 3.  Entrypoint
 # ────────────────────────────────────────────────────────────
 def main() -> None:
-    load_dotenv()                          # picks up WANDB_API_KEY, HF_TOKEN, …
-    
-    env_vars = dict[str, str]()
-    env_vars['WANDB_API_KEY'] = os.getenv('WANDB_API_KEY')
-    env_vars['NCCL_SOCKET_IFNAME'] = 'ibp64s0' # Infiniband
-    env_vars["NEMO_HOME"] = "/cephfs/scratch/BFS/nemo_home"
-    env_vars["NEMO_MODELS_CACHE"] = "/cephfs/scratch/BFS/nemo_home/.cache/nemo/models"
-    # env_vars['NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS'] = 'NET' # NCCL debugging
-    
-    recipe = configure_recipe(nodes=NODES, gpus_per_node=GPUS_PER_NODE)
+    recipe = configure_recipe()
     executor = slurm_executor(
         account          = ACCOUNT,
         partition        = PARTITION,
@@ -229,12 +248,10 @@ def main() -> None:
         node_job_dir     = JOB_DIR,
         container_mounts = CUSTOM_MOUNTS,
         container_image  = CONTAINER_IMAGE,
-        # exclusive        = EXCLUSIVE, # if you want to use exclusive node, set to True or erase this line
         nodelist         = NODELIST,
         exclude          = EXCLUDE,
-        env_vars         = env_vars,
+        env_vars         = ENV_VARS,
     )
-
 
     # detach=False keeps stdout/stderr streaming in your terminal
     run.run(recipe, executor=executor, name=RUN_NAME, detach=True)
