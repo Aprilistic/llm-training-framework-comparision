@@ -1,8 +1,3 @@
-# qwen25_multinode_pretrain.py
-# -----------------------------------------------------------
-# Continual‑pre‑training of Qwen‑2.5‑1.5 B on a Slurm cluster
-# using NeMo‑Run + Pyxis, with W&B logging.
-# -----------------------------------------------------------
 from __future__ import annotations
 
 import os
@@ -13,7 +8,9 @@ from nemo import lightning as nl
 from nemo.collections import llm
 from nemo.collections.common.tokenizers import AutoTokenizer
 from megatron.core.optimizer import OptimizerConfig
+from nemo.lightning.pytorch.optim import CosineAnnealingScheduler, MegatronOptimizerModule, PytorchOptimizerModule
 from lightning.pytorch.loggers import WandbLogger
+
 
 load_dotenv()
 
@@ -41,6 +38,7 @@ LIMIT_VAL_BATCHES = 0 # 0 means no validation
 VAL_CHECK_INTERVAL = 100
 LOG_EVERY_N_STEPS = 10
 CHECKPOINT_DIR_BASE_PATH = f"/cephfs/scratch/{PROJECT_NAME}/{RUN_NAME}"
+CHECKPOINT_EVERY_N_STEPS = 500
 
 # Learning Rate Related
 WARMUP_STEPS = MAX_STEPS * 0.1
@@ -48,7 +46,7 @@ MIN_LR = 1.5e-06
 MAX_LR = 1.5e-05
 
 # GPU and Node Related
-NODES = 1
+NODES = 4
 GPUS_PER_NODE = 8
 
 TENSOR_PARALLEL = 2
@@ -72,7 +70,7 @@ ENV_VARS = {
     'WANDB_API_KEY': os.getenv('WANDB_API_KEY'),
     'NCCL_SOCKET_IFNAME': 'ibp64s0', # Infiniband
     'NEMO_HOME': '/cephfs/scratch/BFS/nemo_home',
-    'NEMO_MODELS_CACHE': '/cephfs/scratch/BFS/nemo_home/.cache/nemo/models',
+    'NEMO_MODELS_CACHE': '/cephfs/scratch/BFS/nemo_home/.cache/nemo/models', # import_ckpt saves to this path
 }
 
 
@@ -92,7 +90,7 @@ def configure_recipe() -> run.Partial:
         num_nodes=NODES,
         num_gpus_per_node=GPUS_PER_NODE,
     )
-    # recipe.model.config.seq_length = SEQUENCE_LENGTH
+    recipe.model.config.seq_length = SEQUENCE_LENGTH
 
     # Continual‑learning resume logic
     recipe.resume = run.Config(
@@ -113,26 +111,9 @@ def configure_recipe() -> run.Partial:
     recipe.trainer.limit_val_batches = LIMIT_VAL_BATCHES
     recipe.trainer.val_check_interval = VAL_CHECK_INTERVAL
 
-    
-    # Modify Learning Rate Scheduler if needed
-    # from torch.optim import AdamW
-
-    # recipe.optim = run.Config(
-    #     PytorchOptimizerModule,
-    #     optimizer_fn=run.Partial(
-    #         AdamW,
-    #         lr=MAX_LR,
-    #         weight_decay=0.1,
-    #         betas=(0.9, 0.95),
-    #         eps=1e-8,
-    #         foreach=True,
-    #     ),
-    # )
-    
-    # recipe.optim.optimizer = "adamw"
-    recipe.optim.lr_scheduler.warmup_steps = WARMUP_STEPS
-    recipe.optim.lr_scheduler.min_lr = MIN_LR
     recipe.optim.config.lr = MAX_LR
+    recipe.optim.lr_scheduler.min_lr = MIN_LR
+    recipe.optim.lr_scheduler.warmup_steps = WARMUP_STEPS
     
     # For testing, comment following data reinitialization. MockDataModule is used with recipe as default. 
     recipe.data = run.Config(
@@ -153,9 +134,9 @@ def configure_recipe() -> run.Partial:
     # Checkpointing
     recipe.log.ckpt = run.Config(
         nl.ModelCheckpoint,
-        # save_last=True,
+        # save_last=True, # save last checkpoint only
         save_top_k=1,
-        every_n_train_steps=10,
+        every_n_train_steps=CHECKPOINT_EVERY_N_STEPS,
         filename="{PRETRAINED_MODEL_NAME}--{step}-{consumed_samples}"
     )
 
